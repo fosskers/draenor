@@ -1,0 +1,17 @@
+[
+    {
+        "name": "south-america",
+        "countries": [
+            "argentina",
+            "bolivia",
+            "brazil",
+            "chile",
+            "colombia",
+            "ecuador",
+            "paraguay",
+            "peru",
+            "suriname",
+            "uruguay"
+        ]
+    }
+]

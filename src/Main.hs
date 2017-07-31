@@ -2,12 +2,15 @@
 {-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main where
+module Main (main) where
 
+import           Control.Concurrent.Async
 import           Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as B
+import qualified Data.Map as M
 import           Data.Monoid
 import           Data.Text (Text)
+import           Filesystem.Path (basename)
 import           GHC.Generics
 import           Options.Generic
 import           Prelude hiding (FilePath)
@@ -15,11 +18,15 @@ import           Shelly
 
 ---
 
-data Args = Args { areas :: String <?> "Path to a JSON file defining areas to convert." }
-  deriving (Generic, ParseRecord)
+data Args = Args { areas :: String <?> "Path to a JSON file defining areas to convert."
+                 , cache :: FilePath <?> "Path to a directory for storing the downloaded .pbf files."
+                 } deriving (Generic, ParseRecord)
+
+-- | The runtime environment.
+data Env = Env FilePath (M.Map Text FilePath)
 
 -- | An OSM Extract area to process.
-data Area = Area { name :: Text, countries :: [Text] } deriving (Generic, FromJSON, Show)
+data Area = Area { name :: Text, countries :: [Text] } deriving (Generic, FromJSON)
 
 -- | Location of `osm2orc` executable (java program).
 osm2orc :: FilePath
@@ -29,30 +36,43 @@ osm2orc = "/home/colin/code/java/osm2orc/build/distributions/osm2orc-0.3.1/bin/o
 s3 :: Text
 s3 = "s3://vectortiles/orc/"
 
-root :: Text
-root = "download.geofabrik.de/"
+-- | Given an `Area` name and a country, form the URL of where its PBF file should be located.
+url :: Text -> Text -> Text
+url n c = "download.geofabrik.de/" <> n <> "/" <> c <> "-latest.osm.pbf"
 
--- | Given an `Area`, form the URLs of where its PBF files should be located.
-urls :: Area -> [Text]
-urls (Area n cs) = map (\c -> n <> "/" <> c <> "-latest.osm.pbf") cs
-
--- | Download a given `.osm.pbf` file to the filesystem.
-download :: Text -> IO FilePath
-download = undefined
+-- | If not already present on the filesystem, download a given `.osm.pbf` file.
+download :: Env -> Text -> Text -> Sh FilePath
+download (Env cpath pbfs) n c = case M.lookup c pbfs of
+  Just fp -> echo (c <> " already downloaded.") >> pure fp
+  Nothing -> do
+    let fp = cpath </> c <.> "osm.pbf"
+    echo $ "Downloading " <> c <> " data..."
+    run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]
+    pure fp
 
 -- | Convert a downloaded `.osm.pbf` to a `.orc`.
-convert :: FilePath -> IO FilePath
-convert = undefined
+convert :: Env -> FilePath -> Sh Text
+convert (Env cpath _) pbf = echo ("Converting " <> pbf') >> run_ osm2orc [pbf', orc] >> pure orc
+  where orc = toTextIgnore $ cpath </> basename pbf <.> "orc"
+        pbf' = toTextIgnore pbf
 
 -- | Upload a converted `.orc` to S3.
-upload :: FilePath -> IO ()
-upload = undefined
+upload :: Text -> Sh ()
+upload orc = run_ "aws" ["s3", "cp", orc, s3]
 
-work :: [Area] -> IO ()
-work as = mapM_ print as
+convertArea :: Env -> Area -> IO ()
+convertArea env a = forConcurrently_ (countries a) $ \c ->
+  shelly (download env (name a) c >>= convert env >> pure ()) --upload)
+
+work :: Env -> [Area] -> IO ()
+work env as = mapConcurrently_ (convertArea env) as
 
 main :: IO ()
 main = do
-  Args (Helpful as) <- getRecord "Draenor - Batch convert OSM PBF to ORC and upload to S3."
+  Args (Helpful as) (Helpful c) <- getRecord "Draenor - Batch convert OSM PBF to ORC and upload to S3."
+  pbfs <- shelly $ mkdir_p c >> ls c  -- All already downloaded pbf files.
   bytes <- B.readFile as
-  either putStrLn (\as' -> work as' >> putStrLn "Done.") $ eitherDecode bytes
+  let env = Env c $ M.fromList $ map (\p -> (toTextIgnore $ basename p, p)) pbfs
+  case decode bytes of
+    Nothing -> putStrLn "There was a parsing error in your JSON file."
+    Just as' -> work env as' >> putStrLn "Done."
