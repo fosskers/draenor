@@ -24,6 +24,7 @@ import           Shelly
 
 data Args = Args { areas :: String <?> "Path to a JSON file defining areas to convert."
                  , cache :: FilePath <?> "Path to a directory for storing the downloaded .pbf files."
+                 , threads :: Int <?> "Number of CPU threads to use."
                  } deriving (Generic, ParseRecord)
 
 -- | The runtime environment.
@@ -79,30 +80,33 @@ convert env = do
 
 -- | Upload a converted `.orc` to S3.
 upload :: Env -> IO ()
--- upload orc = run_ "aws" ["s3", "cp", orc, s3]
 upload env = do
   next <- atomically $ (,,) <$> tryPeekTChan (_countries env) <*> tryPeekTChan (_toConvert env) <*> tryReadTChan (_toUpload env)
   case next of
     (Nothing, Nothing, Nothing) -> pure ()  -- All uploads complete.
-    (_, _, Just t) -> TIO.putStrLn ("Uploading " <> t) >> upload env
+    (_, _, Just orc) -> do
+      TIO.putStrLn $ "Uploading " <> orc
+      shelly $ run_ "aws" ["s3", "cp", orc, s3, "--quiet"]
+      TIO.putStrLn $ "Uploading " <> orc <> " complete!"
+      upload env
     _ -> threadDelay 1000000 >> upload env
 
-work :: Env -> [Area] -> IO ()
-work env as = do
+work :: Env -> Int -> [Area] -> IO ()
+work env t as = do
   atomically . mapM_ (writeTChan (_countries env)) $ as >>= \(Area n cs) -> map (\c -> (n, c)) cs
   void . runConcurrently $ (,,)
-    <$> Concurrently (replicateConcurrently_ 4 $ download env)
-    <*> Concurrently (replicateConcurrently_ 4 $ convert env)
-    <*> Concurrently (replicateConcurrently_ 4 $ upload env)
+    <$> Concurrently (replicateConcurrently_ t $ download env)
+    <*> Concurrently (replicateConcurrently_ t $ convert env)
+    <*> Concurrently (replicateConcurrently_ t $ upload env)
 
 main :: IO ()
 main = do
-  Args (Helpful as) (Helpful c) <- getRecord "Draenor - Batch convert OSM PBF to ORC and upload to S3."
+  Args (Helpful as) (Helpful c) (Helpful t) <- getRecord "Draenor - Batch convert OSM PBF to ORC and upload to S3."
   pbfs <- shelly $ mkdir_p c >> ls c  -- All already downloaded pbf files.
   bytes <- B.readFile as
   (cc, fc, tc) <- (,,) <$> newTChanIO <*> newTChanIO <*> newTChanIO
-  let pbfs' = M.fromList $ map (\p -> (toTextIgnore $ basename p, p)) pbfs
+  let pbfs' = M.fromList . map (\p -> (toTextIgnore $ basename p, p)) $ filter (hasExt "pbf") pbfs
       env = Env c pbfs' cc fc tc
   case decode bytes of
     Nothing -> putStrLn "There was a parsing error in your JSON file."
-    Just as' -> work env as' >> putStrLn "Done."
+    Just as' -> work env t as' >> putStrLn "Done."
