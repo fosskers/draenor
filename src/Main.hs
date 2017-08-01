@@ -29,10 +29,13 @@ data Args = Args { areas :: String <?> "Path to a JSON file defining areas to co
 
 -- | The runtime environment.
 data Env = Env { _cache :: FilePath
+               , _threads :: Int
                , _downloaded :: M.Map Text FilePath
                , _countries :: TChan (Text, Text)
                , _toConvert :: TChan FilePath
-               , _toUpload :: TChan Text }
+               , _toUpload :: TChan Text
+               , _downloadDone :: TVar Int
+               , _conversionDone :: TVar Int }
 
 -- | An OSM Extract area to process.
 data Area = Area { name :: Text, countries :: [Text] } deriving (Generic, FromJSON)
@@ -54,7 +57,7 @@ download :: Env -> IO ()
 download env = do
   next <- atomically . tryReadTChan $ _countries env
   case next of
-    Nothing -> pure ()  -- All downloads complete.
+    Nothing -> atomically $ modifyTVar' (_downloadDone env) (+ 1)
     Just (n, c) -> getNext n c >>= atomically . writeTChan (_toConvert env) >> download env
   where getNext n c = case M.lookup c (_downloaded env) of
           Just fp -> TIO.putStrLn (c <> " already downloaded.") >> pure fp
@@ -66,10 +69,10 @@ download env = do
 
 convert :: Env -> IO ()
 convert env = do
-  next <- atomically $ (,) <$> tryPeekTChan (_countries env) <*> tryReadTChan (_toConvert env)
+  next <- atomically $ (,) <$> readTVar (_downloadDone env) <*> tryReadTChan (_toConvert env)
   case next of
-    (Nothing, Nothing) -> pure ()  -- All conversions complete.
-    (Just _, Nothing) -> threadDelay 1000000 >> convert env
+    (n, Nothing) | n == _threads env -> atomically $ modifyTVar' (_conversionDone env) (+ 1)
+                 | otherwise -> threadDelay 1000000 >> convert env
     (_, Just pbf) -> do
       let pbf' = toTextIgnore pbf
           orc  = toTextIgnore $ _cache env </> basename pbf <.> "orc"
@@ -81,15 +84,15 @@ convert env = do
 -- | Upload a converted `.orc` to S3.
 upload :: Env -> IO ()
 upload env = do
-  next <- atomically $ (,,) <$> tryPeekTChan (_countries env) <*> tryPeekTChan (_toConvert env) <*> tryReadTChan (_toUpload env)
+  next <- atomically $ (,) <$> readTVar (_conversionDone env) <*> tryReadTChan (_toUpload env)
   case next of
-    (Nothing, Nothing, Nothing) -> pure ()  -- All uploads complete.
-    (_, _, Just orc) -> do
+    (n, Nothing) | n == _threads env -> pure ()  -- All uploads complete.
+                 | otherwise -> threadDelay 1000000 >> upload env
+    (_, Just orc) -> do
       TIO.putStrLn $ "Uploading " <> orc
       shelly $ run_ "aws" ["s3", "cp", orc, s3, "--quiet"]
       TIO.putStrLn $ "Uploading " <> orc <> " complete!"
       upload env
-    _ -> threadDelay 1000000 >> upload env
 
 work :: Env -> Int -> [Area] -> IO ()
 work env t as = do
@@ -105,8 +108,9 @@ main = do
   pbfs <- shelly $ mkdir_p c >> ls c  -- All already downloaded pbf files.
   bytes <- B.readFile as
   (cc, fc, tc) <- (,,) <$> newTChanIO <*> newTChanIO <*> newTChanIO
+  (dt, ct) <- (,) <$> newTVarIO 0 <*> newTVarIO 0
   let pbfs' = M.fromList . map (\p -> (toTextIgnore $ basename p, p)) $ filter (hasExt "pbf") pbfs
-      env = Env c pbfs' cc fc tc
+      env = Env c t pbfs' cc fc tc dt ct
   case decode bytes of
     Nothing -> putStrLn "There was a parsing error in your JSON file."
     Just as' -> work env t as' >> putStrLn "Done."
