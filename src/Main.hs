@@ -4,12 +4,16 @@
 
 module Main (main) where
 
+import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async
+import           Control.Concurrent.STM
+import           Control.Monad (void)
 import           Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Map as M
 import           Data.Monoid
 import           Data.Text (Text)
+import qualified Data.Text.IO as TIO
 import           Filesystem.Path (basename)
 import           GHC.Generics
 import           Options.Generic
@@ -23,7 +27,11 @@ data Args = Args { areas :: String <?> "Path to a JSON file defining areas to co
                  } deriving (Generic, ParseRecord)
 
 -- | The runtime environment.
-data Env = Env FilePath (M.Map Text FilePath)
+data Env = Env { _cache :: FilePath
+               , _downloaded :: M.Map Text FilePath
+               , _countries :: TChan (Text, Text)
+               , _toConvert :: TChan FilePath
+               , _toUpload :: TChan Text }
 
 -- | An OSM Extract area to process.
 data Area = Area { name :: Text, countries :: [Text] } deriving (Generic, FromJSON)
@@ -41,38 +49,60 @@ url :: Text -> Text -> Text
 url n c = "download.geofabrik.de/" <> n <> "/" <> c <> "-latest.osm.pbf"
 
 -- | If not already present on the filesystem, download a given `.osm.pbf` file.
-download :: Env -> Text -> Text -> Sh FilePath
-download (Env cpath pbfs) n c = case M.lookup c pbfs of
-  Just fp -> echo (c <> " already downloaded.") >> pure fp
-  Nothing -> do
-    let fp = cpath </> c <.> "osm.pbf"
-    echo $ "Downloading " <> c <> " data..."
-    run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]
-    pure fp
+download :: Env -> IO ()
+download env = do
+  next <- atomically . tryReadTChan $ _countries env
+  case next of
+    Nothing -> pure ()  -- All downloads complete.
+    Just (n, c) -> getNext n c >>= atomically . writeTChan (_toConvert env) >> download env
+  where getNext n c = case M.lookup c (_downloaded env) of
+          Just fp -> TIO.putStrLn (c <> " already downloaded.") >> pure fp
+          Nothing -> do
+            let fp = _cache env </> c <.> "osm.pbf"
+            TIO.putStrLn $ "Downloading " <> c <> " data..."
+            shelly $ run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]
+            pure fp
 
--- | Convert a downloaded `.osm.pbf` to a `.orc`.
-convert :: Env -> FilePath -> Sh Text
-convert (Env cpath _) pbf = echo ("Converting " <> pbf') >> run_ osm2orc [pbf', orc] >> pure orc
-  where orc = toTextIgnore $ cpath </> basename pbf <.> "orc"
-        pbf' = toTextIgnore pbf
+convert :: Env -> IO ()
+convert env = do
+  next <- atomically $ (,) <$> tryPeekTChan (_countries env) <*> tryReadTChan (_toConvert env)
+  case next of
+    (Nothing, Nothing) -> pure ()  -- All conversions complete.
+    (Just _, Nothing) -> threadDelay 1000000 >> convert env
+    (_, Just pbf) -> do
+      let pbf' = toTextIgnore pbf
+          orc  = toTextIgnore $ _cache env </> basename pbf <.> "orc"
+      TIO.putStrLn $ "Converting " <> pbf'
+      shelly $ run_ osm2orc [pbf', orc]
+      atomically $ writeTChan (_toUpload env) orc
+      convert env
 
 -- | Upload a converted `.orc` to S3.
-upload :: Text -> Sh ()
-upload orc = run_ "aws" ["s3", "cp", orc, s3]
-
-convertArea :: Env -> Area -> IO ()
-convertArea env a = forConcurrently_ (countries a) $ \c ->
-  shelly (download env (name a) c >>= convert env >> pure ()) --upload)
+upload :: Env -> IO ()
+-- upload orc = run_ "aws" ["s3", "cp", orc, s3]
+upload env = do
+  next <- atomically $ (,,) <$> tryPeekTChan (_countries env) <*> tryPeekTChan (_toConvert env) <*> tryReadTChan (_toUpload env)
+  case next of
+    (Nothing, Nothing, Nothing) -> pure ()  -- All uploads complete.
+    (_, _, Just t) -> TIO.putStrLn ("Uploading " <> t) >> upload env
+    _ -> threadDelay 1000000 >> upload env
 
 work :: Env -> [Area] -> IO ()
-work env as = mapConcurrently_ (convertArea env) as
+work env as = do
+  atomically . mapM_ (writeTChan (_countries env)) $ as >>= \(Area n cs) -> map (\c -> (n, c)) cs
+  void . runConcurrently $ (,,)
+    <$> Concurrently (replicateConcurrently_ 4 $ download env)
+    <*> Concurrently (replicateConcurrently_ 4 $ convert env)
+    <*> Concurrently (replicateConcurrently_ 4 $ upload env)
 
 main :: IO ()
 main = do
   Args (Helpful as) (Helpful c) <- getRecord "Draenor - Batch convert OSM PBF to ORC and upload to S3."
   pbfs <- shelly $ mkdir_p c >> ls c  -- All already downloaded pbf files.
   bytes <- B.readFile as
-  let env = Env c $ M.fromList $ map (\p -> (toTextIgnore $ basename p, p)) pbfs
+  (cc, fc, tc) <- (,,) <$> newTChanIO <*> newTChanIO <*> newTChanIO
+  let pbfs' = M.fromList $ map (\p -> (toTextIgnore $ basename p, p)) pbfs
+      env = Env c pbfs' cc fc tc
   case decode bytes of
     Nothing -> putStrLn "There was a parsing error in your JSON file."
     Just as' -> work env as' >> putStrLn "Done."
