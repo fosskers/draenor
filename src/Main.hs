@@ -1,3 +1,4 @@
+{-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE DataKinds, TypeOperators #-}
 {-# LANGUAGE DeriveGeneric, DeriveAnyClass #-}
 {-# LANGUAGE OverloadedStrings #-}
@@ -7,6 +8,7 @@ module Main (main) where
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
+import           Control.Exception (SomeException, catch)
 import           Control.Monad (void)
 import           Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as B
@@ -58,8 +60,9 @@ download env = do
           Nothing -> do
             let fp = (unHelpful . cache $ _args env) </> c <.> "osm.pbf"
             TIO.putStrLn $ "Downloading " <> c <> " data..."
-            shelly $ run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]
-            pure fp
+            catch @SomeException
+              (shelly (run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]) >> pure fp)
+              (const (TIO.putStrLn "Trying again..." >> getNext n c))
 
 convert :: Env -> IO ()
 convert env = do
