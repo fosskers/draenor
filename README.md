@@ -2,6 +2,8 @@
 
 Convert OSM PBF files into ORC, and upload them to S3.
 
+*In the Warcraft universe, Draenor is the home planet of the Orcs.*
+
 ### Dependencies ###
 
 - [`stack`](https://docs.haskellstack.org/en/stable/README/)
