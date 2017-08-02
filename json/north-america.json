@@ -1,0 +1,15 @@
+[
+    {
+        "name": "north-america",
+        "countries": [
+            "canada",
+            "greenland",
+            "mexico",
+            "us-midwest",
+            "us-northeast",
+            "us-pacific",
+            "us-south",
+            "us-west"
+        ]
+    }
+]
