@@ -3,7 +3,8 @@
 # Install dependencies
 sudo apt update
 sudo apt upgrade -y
-sudo apt install openjdk-8-jre openjdk-8-jdk awscli -y
+sudo apt install openjdk-8-jre openjdk-8-jdk python-pip -y
+sudo pip install awscli
 wget -qO- https://get.haskellstack.org/ | sh
 
 # Set up osm2orc
