@@ -62,7 +62,7 @@ download env = do
             TIO.putStrLn $ "Downloading " <> c <> " data..."
             catch @SomeException
               (shelly (run_ "wget" ["-q", "-O", toTextIgnore fp, url n c]) >> pure fp)
-              (const (TIO.putStrLn "Trying again..." >> getNext n c))
+              (const (threadDelay 5000000 >> TIO.putStrLn "Trying again..." >> getNext n c))
 
 convert :: Env -> IO ()
 convert env = do
